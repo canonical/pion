@@ -60,10 +60,10 @@ parts:
 
       craftctl set version="$(node -p "require('./package.json').version")"
 
-      # Ship the extension as a pi package: package.json, README and the
+      # Ship the extension as a pi package: package.json, README, LICENSE and the
       # TypeScript sources. pi provides @earendil-works/pi-coding-agent at
       # runtime, and there are no other runtime dependencies, so no
       # node_modules are shipped.
       DEST="$CRAFT_PART_INSTALL/pi/extensions/pion"
-      install -D -m 0644 -t "$DEST" package.json README.md
+      install -D -m 0644 -t "$DEST" package.json README.md LICENSE
       install -D -m 0644 -t "$DEST/src" src/*.ts
