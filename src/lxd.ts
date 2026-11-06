@@ -11,18 +11,16 @@
  *   runs in its own session and is killed by process group from a second exec.
  */
 
-import { type ChildProcess, spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
-import path from "node:path";
 import { type BackendInfo, type ExecOptions, type ExecResult, type Progress, type SandboxBackend, shq } from "./backend.ts";
 import type { SandboxConfig } from "./config.ts";
+import { KILL_GROUP_SCRIPT, probeGuest, runCli, runClient, runSetupOnce, SESSION_WRAPPER, SessionRegistry } from "./shared.ts";
 
 export const MOUNT_DEVICE = "pion-project";
 const MANAGED_KEY = "user.pion.managed";
 const PROJECT_KEY = "user.pion.project";
-const KILL_GRACE_MS = 2000;
 
 interface RunResult {
 	code: number | null;
@@ -47,21 +45,16 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Pattern of a command line that a POSIX sh runs in the guest as a killable session leader. */
-const SESSION_WRAPPER = `echo $$ > "$PION_PIDFILE"; "$@"; rc=$?; rm -f "$PION_PIDFILE"; exit $rc`;
-
 export class LxdBackend implements SandboxBackend {
 	private readonly cfg: SandboxConfig;
 	private user: GuestUser | undefined;
 	private info: BackendInfo | undefined;
 	private released = false;
-	private readonly lockDir: string;
+	private readonly sessions: SessionRegistry;
 
 	constructor(cfg: SandboxConfig) {
 		this.cfg = cfg;
-		const runtime = process.env.XDG_RUNTIME_DIR || path.join(os.tmpdir(), `pion-${os.userInfo().username}`);
-		const key = createHash("sha256").update(`${cfg.lxd.remote}\0${cfg.lxd.project}\0${cfg.lxd.instance}`).digest("hex").slice(0, 16);
-		this.lockDir = path.join(runtime, "pion", key);
+		this.sessions = new SessionRegistry("lxd", cfg.lxd.remote, cfg.lxd.project, cfg.lxd.instance);
 	}
 
 	/** `remote:instance` or `instance`. */
@@ -75,18 +68,7 @@ export class LxdBackend implements SandboxBackend {
 
 	/** Run the lxc CLI and collect output. */
 	private run(args: string[], input?: string): Promise<RunResult> {
-		return new Promise((resolve, reject) => {
-			const child = spawn(this.cfg.lxd.lxc, [...this.globalArgs(), ...args], { stdio: ["pipe", "pipe", "pipe"] });
-			const out: Buffer[] = [];
-			const err: Buffer[] = [];
-			child.stdout.on("data", (d: Buffer) => out.push(d));
-			child.stderr.on("data", (d: Buffer) => err.push(d));
-			child.on("error", (e) => reject(new Error(`failed to run ${this.cfg.lxd.lxc}: ${e.message}`)));
-			child.on("close", (code) =>
-				resolve({ code, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8") }),
-			);
-			child.stdin.end(input ?? "");
-		});
+		return runCli(this.cfg.lxd.lxc, [...this.globalArgs(), ...args], input);
 	}
 
 	private async runOk(args: string[], what: string): Promise<string> {
@@ -271,35 +253,6 @@ printf '%s\\n%s\\n%s\\n' "$existing" "$home" "$gid"
 		return { uid, gid: Number(guestGid) || gid, name: guestName || name, home: home || "/" };
 	}
 
-	/** Run `installTools` and user `setup` commands once per distinct set of commands. */
-	private async provisionSetup(progress: Progress): Promise<void> {
-		const steps: string[] = [];
-		if (this.cfg.installTools) {
-			steps.push(
-				"command -v rg >/dev/null 2>&1 || " +
-					"{ if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ripgrep; " +
-					"elif command -v dnf >/dev/null 2>&1; then dnf install -y -q ripgrep; " +
-					"elif command -v apk >/dev/null 2>&1; then apk add -q ripgrep; " +
-					"elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm ripgrep; " +
-					"elif command -v zypper >/dev/null 2>&1; then zypper -n install ripgrep; fi; } || echo 'pion: could not install ripgrep; falling back to grep/find' >&2",
-			);
-		}
-		steps.push(...this.cfg.setup);
-		if (steps.length === 0) return;
-		const digest = createHash("sha256").update(JSON.stringify(steps)).digest("hex");
-		const marker = "/var/lib/pion/setup.sha256";
-		const check = await this.rawExec(["cat", marker], { asRoot: true });
-		if (check.code === 0 && check.stdout.trim() === digest) return;
-		for (const [i, step] of steps.entries()) {
-			progress(`setup ${i + 1}/${steps.length}`);
-			const r = await this.rawExec(["sh", "-c", step], { asRoot: true });
-			if (r.code !== 0) {
-				throw new Error(`setup command failed (exit ${r.code}): ${step}\n${(r.stderr || r.stdout).trim().slice(-2000)}`);
-			}
-		}
-		await this.rawExec(["sh", "-c", `mkdir -p /var/lib/pion && printf '%s\\n' ${shq(digest)} > ${marker}`], { asRoot: true });
-	}
-
 	async start(progress: Progress): Promise<BackendInfo> {
 		if (this.info) return this.info;
 		this.released = false;
@@ -316,19 +269,16 @@ printf '%s\\n%s\\n%s\\n' "$existing" "$home" "$gid"
 			progress(`starting VM ${this.target}`);
 			await this.runOk(["start", this.target], `starting LXD VM ${this.target}`);
 		}
-		this.registerSession();
+		this.sessions.register(this.cfg.projectDir);
 		await this.waitForAgent(progress);
 		await this.waitForMount(progress);
 		this.user = undefined;
 		await this.waitForCloudInit(progress);
 		const user = await this.provisionUser(progress);
-		await this.provisionSetup(progress);
+		await runSetupOnce(this.cfg, (argv) => this.rawExec(argv, { asRoot: true }), progress);
 		this.user = user;
 
-		const probe = await this.rawExec(["sh", "-c", "command -v bash || command -v sh; command -v rg >/dev/null 2>&1 && echo rg=yes || echo rg=no"]);
-		const lines = probe.stdout.trim().split("\n");
-		const shell = lines[0]?.startsWith("/") ? lines[0] : "/bin/sh";
-		const hasRipgrep = lines.includes("rg=yes");
+		const { shell, hasRipgrep } = await probeGuest((argv) => this.rawExec(argv));
 
 		this.info = {
 			kind: "lxd",
@@ -364,116 +314,16 @@ printf '%s\\n%s\\n%s\\n' "$existing" "$home" "$gid"
 		for (const [k, v] of Object.entries(env)) args.push("--env", `${k}=${v}`);
 		args.push("--", "setsid", "-w", "sh", "-c", SESSION_WRAPPER, "sh", ...argv);
 
-		return new Promise((resolve, reject) => {
-			if (options.signal?.aborted) {
-				resolve({ exitCode: null, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), timedOut: false, aborted: true });
-				return;
-			}
-			let child: ChildProcess;
-			try {
-				child = spawn(this.cfg.lxd.lxc, args, { stdio: ["pipe", "pipe", "pipe"] });
-			} catch (e) {
-				reject(e);
-				return;
-			}
-			const out: Buffer[] = [];
-			const err: Buffer[] = [];
-			let timedOut = false;
-			let aborted = false;
-			let killing = false;
-
-			const kill = () => {
-				if (killing) return;
-				killing = true;
-				void this.killGroup(pidfile).finally(() => {
-					// The client normally exits once the guest process is gone; make sure.
-					setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS).unref();
-				});
-			};
-			const onAbort = () => {
-				aborted = true;
-				kill();
-			};
-			options.signal?.addEventListener("abort", onAbort, { once: true });
-			const timer =
-				options.timeoutMs && options.timeoutMs > 0
-					? setTimeout(() => {
-							timedOut = true;
-							kill();
-						}, options.timeoutMs)
-					: undefined;
-
-			child.stdout!.on("data", (d: Buffer) => (options.onStdout ? options.onStdout(d) : out.push(d)));
-			child.stderr!.on("data", (d: Buffer) => (options.onStderr ? options.onStderr(d) : err.push(d)));
-			child.on("error", (e) => {
-				if (timer) clearTimeout(timer);
-				options.signal?.removeEventListener("abort", onAbort);
-				reject(new Error(`failed to run ${this.cfg.lxd.lxc}: ${e.message}`));
-			});
-			child.on("close", (code, signal) => {
-				if (timer) clearTimeout(timer);
-				options.signal?.removeEventListener("abort", onAbort);
-				resolve({
-					exitCode: code ?? (signal ? 128 + (os.constants.signals[signal] ?? 0) : null),
-					stdout: Buffer.concat(out),
-					stderr: Buffer.concat(err),
-					timedOut,
-					aborted,
-				});
-			});
-			child.stdin!.on("error", () => {});
-			child.stdin!.end(options.stdin ?? "");
-		});
+		return runClient(this.cfg.lxd.lxc, args, options, () => this.killGroup(pidfile));
 	}
 
 	/** SIGTERM the command's process group in the guest, then SIGKILL after a grace period. */
 	private async killGroup(pidfile: string): Promise<void> {
-		const script = `
-f=$1
-pg=$(cat "$f" 2>/dev/null) || exit 0
-kill -TERM "-$pg" 2>/dev/null || exit 0
-i=0
-while [ $i -lt 20 ]; do kill -0 "-$pg" 2>/dev/null || { rm -f "$f"; exit 0; }; sleep 0.1; i=$((i+1)); done
-kill -KILL "-$pg" 2>/dev/null
-rm -f "$f"
-`;
 		try {
-			await this.rawExec(["sh", "-c", script, "sh", pidfile], { asRoot: true });
+			await this.rawExec(["sh", "-c", KILL_GROUP_SCRIPT, "sh", pidfile], { asRoot: true });
 		} catch {
 			// Best effort; the local client is killed regardless.
 		}
-	}
-
-	// --- Session accounting so concurrent pi sessions share one VM safely. ---
-
-	private registerSession(): void {
-		try {
-			mkdirSync(this.lockDir, { recursive: true });
-			writeFileSync(path.join(this.lockDir, String(process.pid)), this.cfg.projectDir);
-		} catch {
-			// Accounting is best effort; worst case another session's VM is stopped on exit.
-		}
-	}
-
-	/** Remove this session's marker and return how many other live sessions use the VM. */
-	private unregisterSession(): number {
-		let others = 0;
-		try {
-			rmSync(path.join(this.lockDir, String(process.pid)), { force: true });
-			for (const entry of readdirSync(this.lockDir)) {
-				const pid = Number(entry);
-				if (!Number.isInteger(pid)) continue;
-				try {
-					process.kill(pid, 0);
-					others++;
-				} catch {
-					rmSync(path.join(this.lockDir, entry), { force: true });
-				}
-			}
-		} catch {
-			// Treat as no other sessions.
-		}
-		return others;
 	}
 
 	async shutdown(progress: Progress, reason: "quit" | "switch"): Promise<void> {
@@ -482,7 +332,7 @@ rm -f "$f"
 		const wasStarted = this.info !== undefined;
 		this.info = undefined;
 		this.user = undefined;
-		const others = this.unregisterSession();
+		const others = this.sessions.unregister();
 		const policy = this.cfg.lxd.onExit;
 		if (reason !== "quit" || policy === "keep" || !wasStarted) return;
 		if (others > 0) {

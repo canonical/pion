@@ -1,12 +1,16 @@
 # pion
 
 A [pi](https://github.com/earendil-works/pi) extension that runs the agent's tools inside a
-per-project sandbox instead of on your host. The first backend is **LXD virtual machines**.
+per-project sandbox instead of on your host. Two backends are available:
+
+- **`lxd`** runs a plain LXD virtual machine that pion creates and manages itself.
+- **`workshop`** uses [Canonical Workshop](https://github.com/canonical/workshop), which
+  creates the LXD container (or VM) and installs SDKs such as Go or uv into it.
 
 When a project is configured, pi's built-in `read`, `write`, `edit`, `bash`, `ls`, `find` and
-`grep` tools, and your `!` shell commands, execute inside a VM. The project directory is
-mounted into the VM **read-only** (default) or **writable**. Everything else the agent sees,
-such as `/etc`, `$HOME` and installed packages, belongs to the VM.
+`grep` tools, and your `!` shell commands, execute inside the sandbox. The project directory is
+mounted into the sandbox **read-only** (default) or **writable**. Everything else the agent
+sees, such as `/etc`, `$HOME` and installed packages, belongs to the sandbox.
 
 Projects without configuration are untouched: the tools behave exactly like pi's built-ins.
 
@@ -16,8 +20,12 @@ Projects without configuration are untouched: the tools behave exactly like pi's
 pi install /path/to/pion          # or: pi -e /path/to/pion for one run
 ```
 
-Requirements: the `lxc` CLI talking to an LXD server that can run VMs (`lxc launch --vm` works),
-and your user in the `lxd` group.
+Requirements:
+
+- **lxd backend:** the `lxc` CLI talking to an LXD server that can run VMs
+  (`lxc launch --vm` works), and your user in the `lxd` group.
+- **workshop backend:** the `workshop` CLI, for example `snap install workshop --classic`.
+  Tested with workshop 0.9.9.
 
 ## Configure a project
 
@@ -35,6 +43,11 @@ Configuration comes from two places. Either is enough to turn the sandbox on for
   "projects": {
     "~/work/pion": { "mount": "rw" },
     "~/src/untrusted/*": { "mount": "ro", "lxd": { "onExit": "delete" } },
+    "~/work/api": {
+      "backend": "workshop",
+      "mount": "rw",
+      "workshop": { "sdks": ["go/1.26/stable", "uv"] }
+    },
     "/srv/build": { "backend": "none" }
   }
 }
@@ -54,7 +67,15 @@ export PION_MOUNT=rw
 export PION_LXD_IMAGE=ubuntu:24.04
 export PION_LXD_MEMORY=4GiB
 export PION_SETUP="apt-get install -y build-essential"
-export PION_ENV_GOFLAGS=-mod=mod      # becomes GOFLAGS inside the VM
+export PION_ENV_GOFLAGS=-mod=mod      # becomes GOFLAGS inside the sandbox
+```
+
+Or, for the workshop backend:
+
+```bash
+# .envrc
+export PION_BACKEND=workshop
+export PION_WORKSHOP_SDKS=go,uv/latest/stable
 ```
 
 The directory containing `.envrc` is the project that gets mounted. pion reads these variables
@@ -73,7 +94,7 @@ Lowest to highest: built-in defaults, user `defaults`, `.envrc` or environment, 
 `projects` entry. Your own per-path config always wins over what a repository ships.
 
 A repository's `.envrc` may only set the options in the table marked "envrc". Settings that
-could reach outside the VM boundary, such as instance name, profiles, remote and raw LXD
+could reach outside the sandbox boundary, such as instance name, profiles, remote and raw LXD
 config, are only honoured from your user config. pion reports any other `PION_*` variables it
 ignored in `/pion status`.
 
@@ -81,13 +102,13 @@ ignored in `/pion status`.
 
 | JSON (`pion.json`) | `.envrc` variable | Default | Meaning |
 |---|---|---|---|
-| `backend` | `PION_BACKEND` | `lxd` when configured | `lxd` or `none` |
+| `backend` | `PION_BACKEND` | `lxd` when configured | `lxd`, `workshop` or `none` |
 | `mount` | `PION_MOUNT` | `ro` | `ro` or `rw` project mount |
-| `guestPath` | `PION_GUEST_PATH` | same as host path | Where the project appears in the VM |
-| `env` | `PION_ENV_<NAME>` | `{}` | Extra environment for commands in the VM |
+| `guestPath` | `PION_GUEST_PATH` | same as host path | Where the project appears in the sandbox |
+| `env` | `PION_ENV_<NAME>` | `{}` | Extra environment for commands in the sandbox |
 | `setup` | `PION_SETUP` | `[]` | Commands run as root once, and again whenever they change |
-| `installTools` | `PION_INSTALL_TOOLS` | `true` | Install ripgrep in the VM if missing |
-| `sudo` | `PION_SUDO` | `true` | Passwordless sudo for the VM user |
+| `installTools` | `PION_INSTALL_TOOLS` | `true` | Install ripgrep in the sandbox if missing |
+| `sudo` | `PION_SUDO` | `true` | Passwordless sudo for the sandbox user |
 | `lxd.image` | `PION_LXD_IMAGE` | `ubuntu:24.04` | Image for new VMs |
 | `lxd.cpus` | `PION_LXD_CPUS` | LXD default | `limits.cpu` |
 | `lxd.memory` | `PION_LXD_MEMORY` | LXD default | `limits.memory` |
@@ -100,11 +121,18 @@ ignored in `/pion status`.
 | `lxd.storagePool` | user config only | profile default | Storage pool for new VMs |
 | `lxd.config` | user config only | `{}` | Extra instance config for new VMs |
 | `lxd.lxc` | user config only | `lxc` | CLI binary |
+| `workshop.base` | `PION_WORKSHOP_BASE` | `ubuntu@24.04` | `ubuntu@22.04`, `ubuntu@24.04` or `ubuntu@26.04` |
+| `workshop.runtime` | `PION_WORKSHOP_RUNTIME` | `lxd-container` | `lxd-container` or the experimental `lxd-vm` |
+| `workshop.sdks` | `PION_WORKSHOP_SDKS` | `[]` | Store SDKs, as `name`, `name/channel` or `{ "name", "channel" }`. In `.envrc`, comma-separated |
+| `workshop.onExit` | `PION_WORKSHOP_ON_EXIT` | `stop` | `stop`, `keep` or `delete` (`workshop remove`) when pi quits |
+| `workshop.name` | user config only | `pion-<dir>-<hash>` | Workshop name |
+| `workshop.stateDir` | user config only | `$XDG_STATE_HOME/pion/workshop` | Where pion keeps its private workshop projects |
+| `workshop.cli` | user config only | `workshop` | CLI binary |
 
-Override for a single run with `pi --pion none`, which runs tools on the host. `--pion ro` and
-`--pion rw` force the mount mode.
+Override for a single run with `pi --pion none`, which runs tools on the host. `--pion lxd` and
+`--pion workshop` pick a backend, and `--pion ro` and `--pion rw` force the mount mode.
 
-## What happens at startup
+## What happens at startup: lxd
 
 1. pion resolves the config for pi's working directory. The sandbox is off if nothing matches.
 2. It creates the VM if needed. The VM is tagged `user.pion.managed=true` and records its
@@ -117,31 +145,59 @@ Override for a single run with `pi --pion none`, which runs tools on the host. `
    stay owned by you on the host. On Ubuntu images that is the built-in `ubuntu` user.
 6. It runs `installTools` and `setup` the first time, and again after they change.
 
+## What happens at startup: workshop
+
+Workshop always mounts its own project directory read-write at `/project`. pion therefore does
+not use your repository as the workshop project, because that would rule out read-only mounts
+and put workshop's `.workshop.lock` file in your repository.
+
+1. pion writes a private workshop project to
+   `~/.local/state/pion/workshop/<name>/`. It holds a generated `workshop.yaml` with your base,
+   runtime and SDKs, and an in-project SDK named `pion` with one mount plug.
+2. It runs `workshop launch` the first time. Later it starts a stopped workshop, and runs
+   `workshop refresh` when the generated definition changed, for example after switching
+   between `ro` and `rw` or adding an SDK.
+3. It points the plug at your project with `workshop remount`, stopping the workshop briefly
+   because the directory is not empty. The remount survives refreshes and restarts.
+4. It applies the `sudo` setting, then runs `installTools` and `setup`.
+
+Commands run as workshop's own `workshop` user. Changing `workshop.runtime` after launch is
+refused, because workshop fixes the runtime at launch. pion prints the `workshop remove`
+command to run instead.
+
+Inspect the workshop yourself with `workshop info -p ~/.local/state/pion/workshop/<name> <name>`.
+
+## Shared behaviour
+
 Startup runs in the background. Tools called before it finishes wait for it. The status line
 shows progress, and `/pion` shows details.
 
-When pi quits, the VM is stopped by default. A VM shared by several pi sessions keeps running
-until the last one exits. Reloads and session switches leave it running.
+When pi quits, the sandbox is stopped by default. A sandbox shared by several pi sessions keeps
+running until the last one exits. Reloads and session switches leave it running.
 
 ## Commands
 
-- `/pion` or `/pion status` shows the backend, mount, VM user and config sources.
+- `/pion` or `/pion status` shows the backend, mount, sandbox user and config sources.
 - `/pion start` retries after a failed start.
-- `/pion stop` stops the VM. The next tool call starts it again.
+- `/pion stop` stops the sandbox. The next tool call starts it again.
 
 ## Security notes
 
-- **Read-only is enforced by the host.** LXD's virtiofs share refuses writes even if root in
-  the VM remounts it. This was verified on LXD 6.10.
-- **Host environment is not forwarded.** Commands in the VM get only `PI_*` session variables
+- **Read-only is enforced outside the guest.** LXD's virtiofs share refuses writes even if
+  root in the VM remounts it, verified on LXD 6.10. Workshop's read-only mount plug refuses
+  writes and remounts by root in the container, verified on workshop 0.9.9.
+- **Host environment is not forwarded.** Commands in the sandbox get only `PI_*` session variables
   plus the `env` you configure. Provider API keys in pi's environment stay on the host.
 - **pi itself still runs on the host.** Other extensions' tools, MCP servers, and pi's
   resource loading are not sandboxed.
 - **The read tool may read pi skills and docs from the host.** The system prompt points the
   model at these files, and they do not exist in the VM. Reads are limited to the loaded
   skills' directories and pi's own docs.
-- **A writable mount is a real write path to your host.** Root in the VM, for example via
-  `sudo`, creates root-owned files there. Set `"sudo": false` to prevent that.
+- **A writable mount is a real write path to your host.** In an LXD VM, root, for example via
+  `sudo`, creates root-owned files there. Set `"sudo": false` to prevent that. In a workshop
+  container, root's files appear on the host as an unprivileged mapped uid instead.
+- **`"sudo": false` on workshop** adds a sudoers rule that denies the `workshop` user running
+  commands as anyone else. Workshop grants that sudo itself, so pion overrides it on every start.
 - **Tool failures never fall back to the host.** If the sandbox is configured but broken,
   tools fail until you fix it or run `pi --pion none`.
 
@@ -152,13 +208,22 @@ until the last one exits. Reloads and session switches leave it running.
 - **`find` lists files only:** directories are not included.
 - **grep without ripgrep:** pion falls back to GNU grep `-P`, then `-E`, which does not
   respect `.gitignore`.
-- **Latency:** each file operation is one `lxc exec`, about 100 ms. `ls` uses a single exec.
+- **Latency:** each file operation is one `lxc exec` or `workshop exec`, about 100 to 130 ms.
+  `ls` uses a single exec.
+- **Workshop refreshes are slow and reset the root filesystem.** A refresh takes about 20
+  seconds, and `installTools` and `setup` run again afterwards.
+- **Workshop in-project SDKs are not supported.** pion's workshop runs from its own private
+  project, so `project-*` SDKs from your repository's `.workshop/` directory cannot resolve.
+  Your repository's own `workshop.yaml` is ignored.
+- **Workshop's user is uid 1000.** Host ownership of written files was verified with a host
+  uid of 1000.
 
 ## Adding a backend
 
 Backends implement `SandboxBackend` in `src/backend.ts`: `start`, `exec`, `shutdown` and `stop`.
-All tool behaviour in `src/ops.ts` is built on `exec`. Add the backend to `createBackend` in
-`src/index.ts` and give it a `backend` value in `src/config.ts`.
+All tool behaviour in `src/ops.ts` is built on `exec`. `src/shared.ts` has the session
+accounting, provisioning steps and killable exec client that both backends use. Add the backend
+to `createBackend` in `src/index.ts` and give it a `backend` value in `src/config.ts`.
 
 ## Development
 
@@ -166,5 +231,6 @@ All tool behaviour in `src/ops.ts` is built on `exec`. Add the backend to `creat
 npm install
 npm run check        # type-check
 npm test             # unit tests; shell scripts run against a local exec double
-npm run test:lxd     # end-to-end: creates and deletes a real LXD VM
+npm run test:lxd       # end-to-end: creates and deletes a real LXD VM
+npm run test:workshop  # end-to-end: launches and removes real workshops
 ```

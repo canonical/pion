@@ -18,7 +18,29 @@ import os from "node:os";
 import path from "node:path";
 
 export type MountMode = "ro" | "rw";
-export type BackendKind = "lxd" | "none";
+export type BackendKind = "lxd" | "workshop" | "none";
+export const BACKENDS = ["lxd", "workshop", "none"] as const;
+export type WorkshopRuntime = "lxd-container" | "lxd-vm";
+
+export interface WorkshopSdk {
+	name: string;
+	channel?: string;
+}
+
+export interface WorkshopSettings {
+	/** CLI binary to drive. Defaults to `workshop`. */
+	cli: string;
+	/** Workshop name. Derived from the project path when empty. */
+	name: string;
+	base: string;
+	runtime: WorkshopRuntime;
+	/** SDKs to install, in order. */
+	sdks: WorkshopSdk[];
+	/** What to do with the workshop when the last pi session using it exits. `delete` removes it. */
+	onExit: OnExit;
+	/** Directory holding pion's private workshop projects. */
+	stateDir: string;
+}
 export type OnExit = "stop" | "keep" | "delete";
 
 export interface LxdSettings {
@@ -58,6 +80,7 @@ export interface SandboxConfig {
 	/** Give the guest user passwordless sudo. */
 	sudo: boolean;
 	lxd: LxdSettings;
+	workshop: WorkshopSettings;
 	/** Human-readable list of where settings came from. */
 	sources: string[];
 }
@@ -72,6 +95,7 @@ export interface PartialSandboxConfig {
 	installTools?: boolean;
 	sudo?: boolean;
 	lxd?: Partial<LxdSettings>;
+	workshop?: Partial<WorkshopSettings>;
 }
 
 export interface UserConfigFile {
@@ -184,6 +208,10 @@ const ENV_KEYS = new Set([
 	"PION_LXD_MEMORY",
 	"PION_LXD_DISK",
 	"PION_LXD_ON_EXIT",
+	"PION_WORKSHOP_BASE",
+	"PION_WORKSHOP_RUNTIME",
+	"PION_WORKSHOP_SDKS",
+	"PION_WORKSHOP_ON_EXIT",
 ]);
 
 /**
@@ -266,10 +294,40 @@ function parsePositiveInt(key: string, value: string): number {
 	return n;
 }
 
+const WORKSHOP_RUNTIMES = ["lxd-container", "lxd-vm"] as const;
+const WORKSHOP_BASES = ["ubuntu@22.04", "ubuntu@24.04", "ubuntu@26.04"] as const;
+/** Workshop names: lowercase letter first, then letters/digits joined by single hyphens, max 40. */
+const WORKSHOP_NAME = /^[a-z](?:-?[a-z0-9])*$/;
+const SDK_NAME = /^(?:project-|try-)?(?:[a-z0-9]-?)*[a-z](?:-?[a-z0-9])*$/;
+
+function parseWorkshopBase(key: string, value: string): string {
+	const v = value.trim();
+	if (!(WORKSHOP_BASES as readonly string[]).includes(v)) throw new ConfigError(`${key}: expected one of ${WORKSHOP_BASES.join(", ")}, got "${value}"`);
+	return v;
+}
+
+/** Parse `name` or `name/track/risk` the way `workshop init --sdks` does. */
+function parseSdk(key: string, value: string): WorkshopSdk {
+	const slash = value.indexOf("/");
+	const name = slash < 0 ? value : value.slice(0, slash);
+	const channel = slash < 0 ? undefined : value.slice(slash + 1);
+	if (!SDK_NAME.test(name) || name.length > 48) throw new ConfigError(`${key}: invalid SDK name "${name}"`);
+	if (name.startsWith("project-")) {
+		throw new ConfigError(`${key}: in-project SDKs ("${name}") are not supported; pion runs the workshop from its own private project`);
+	}
+	if (channel !== undefined && !/^[a-z0-9.\-]+(?:\/[a-z0-9.\-]+){0,2}$/.test(channel)) throw new ConfigError(`${key}: invalid SDK channel "${channel}"`);
+	return channel ? { name, channel } : { name };
+}
+
+export function validWorkshopName(name: string): boolean {
+	return name.length <= 40 && WORKSHOP_NAME.test(name);
+}
+
 /** Turn PION_* variables into a partial config. Unknown or disallowed PION_* keys are reported. */
 export function configFromEnv(vars: Record<string, string | undefined>): { config: PartialSandboxConfig; ignored: string[] } {
 	const config: PartialSandboxConfig = {};
 	const lxd: Partial<LxdSettings> = {};
+	const workshop: Partial<WorkshopSettings> = {};
 	const env: Record<string, string> = {};
 	const ignored: string[] = [];
 	for (const [key, value] of Object.entries(vars)) {
@@ -284,7 +342,7 @@ export function configFromEnv(vars: Record<string, string | undefined>): { confi
 		}
 		switch (key) {
 			case "PION_BACKEND":
-				config.backend = parseEnum(key, value, ["lxd", "none"] as const);
+				config.backend = parseEnum(key, value, BACKENDS);
 				break;
 			case "PION_MOUNT":
 				config.mount = parseMount(key, value);
@@ -316,9 +374,26 @@ export function configFromEnv(vars: Record<string, string | undefined>): { confi
 			case "PION_LXD_ON_EXIT":
 				lxd.onExit = parseEnum(key, value, ["stop", "keep", "delete"] as const);
 				break;
+			case "PION_WORKSHOP_BASE":
+				workshop.base = parseWorkshopBase(key, value);
+				break;
+			case "PION_WORKSHOP_RUNTIME":
+				workshop.runtime = parseEnum(key, value, WORKSHOP_RUNTIMES);
+				break;
+			case "PION_WORKSHOP_SDKS":
+				workshop.sdks = value
+					.split(",")
+					.map((v) => v.trim())
+					.filter(Boolean)
+					.map((v) => parseSdk(key, v));
+				break;
+			case "PION_WORKSHOP_ON_EXIT":
+				workshop.onExit = parseEnum(key, value, ["stop", "keep", "delete"] as const);
+				break;
 		}
 	}
 	if (Object.keys(lxd).length > 0) config.lxd = lxd;
+	if (Object.keys(workshop).length > 0) config.workshop = workshop;
 	if (Object.keys(env).length > 0) config.env = env;
 	return { config, ignored };
 }
@@ -371,7 +446,7 @@ function validatePartial(where: string, c: unknown): PartialSandboxConfig {
 	for (const [k, v] of Object.entries(o)) {
 		switch (k) {
 			case "backend":
-				out.backend = parseEnum(`${where}.backend`, str(k, v), ["lxd", "none"] as const);
+				out.backend = parseEnum(`${where}.backend`, str(k, v), BACKENDS);
 				break;
 			case "mount":
 				out.mount = parseMount(`${where}.mount`, str(k, v));
@@ -428,6 +503,50 @@ function validatePartial(where: string, c: unknown): PartialSandboxConfig {
 				out.lxd = l;
 				break;
 			}
+			case "workshop": {
+				if (typeof v !== "object" || v === null || Array.isArray(v)) throw new ConfigError(`${where}.workshop: expected an object`);
+				const w: Partial<WorkshopSettings> = {};
+				for (const [wk, wv] of Object.entries(v as Record<string, unknown>)) {
+					const ww = `${where}.workshop.${wk}`;
+					switch (wk) {
+						case "cli":
+						case "name":
+						case "stateDir":
+							w[wk] = str(`workshop.${wk}`, wv);
+							break;
+						case "base":
+							w.base = parseWorkshopBase(ww, str(`workshop.${wk}`, wv));
+							break;
+						case "runtime":
+							w.runtime = parseEnum(ww, str(`workshop.${wk}`, wv), WORKSHOP_RUNTIMES);
+							break;
+						case "onExit":
+							w.onExit = parseEnum(ww, str(`workshop.${wk}`, wv), ["stop", "keep", "delete"] as const);
+							break;
+						case "sdks": {
+							if (!Array.isArray(wv)) throw new ConfigError(`${ww}: expected a list`);
+							w.sdks = wv.map((item, i) => {
+								if (typeof item === "string") return parseSdk(`${ww}[${i}]`, item);
+								if (typeof item === "object" && item !== null && !Array.isArray(item)) {
+									const o2 = item as Record<string, unknown>;
+									for (const k2 of Object.keys(o2)) {
+										if (k2 !== "name" && k2 !== "channel") throw new ConfigError(`${ww}[${i}].${k2}: unknown option`);
+									}
+									if (typeof o2.name !== "string") throw new ConfigError(`${ww}[${i}].name: expected a string`);
+									if (o2.channel !== undefined && typeof o2.channel !== "string") throw new ConfigError(`${ww}[${i}].channel: expected a string`);
+									return parseSdk(`${ww}[${i}]`, o2.channel ? `${o2.name}/${o2.channel}` : o2.name);
+								}
+								throw new ConfigError(`${ww}[${i}]: expected a string or {name, channel}`);
+							});
+							break;
+						}
+						default:
+							throw new ConfigError(`${ww}: unknown option`);
+					}
+				}
+				out.workshop = w;
+				break;
+			}
 			default:
 				throw new ConfigError(`${where}.${k}: unknown option`);
 		}
@@ -465,6 +584,7 @@ function merge(base: PartialSandboxConfig, over: PartialSandboxConfig): PartialS
 		...over,
 		env: { ...base.env, ...over.env },
 		lxd: { ...base.lxd, ...over.lxd, config: { ...base.lxd?.config, ...over.lxd?.config } },
+		workshop: { ...base.workshop, ...over.workshop },
 	};
 }
 
@@ -478,6 +598,24 @@ export function defaultInstanceName(projectDir: string): string {
 		.replace(/^-+|-+$/g, "")
 		.slice(0, 40);
 	return `pion-${base ? `${base}-` : ""}${hash}`;
+}
+
+/** A workshop name derived from the project path: pion-<dir>-<hash>, within workshop's rules. */
+export function defaultWorkshopName(projectDir: string): string {
+	const hash = createHash("sha256").update(projectDir).digest("hex").slice(0, 8);
+	const base = path
+		.basename(projectDir)
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 26)
+		.replace(/-+$/, "");
+	return `pion-${base ? `${base}-` : ""}${hash}`;
+}
+
+export function defaultStateDir(env: NodeJS.ProcessEnv, home: string): string {
+	const xdg = env.XDG_STATE_HOME && path.isAbsolute(env.XDG_STATE_HOME) ? env.XDG_STATE_HOME : path.join(home, ".local", "state");
+	return path.join(xdg, "pion", "workshop");
 }
 
 export function validInstanceName(name: string): boolean {
@@ -554,6 +692,13 @@ export function resolveConfig(opts: ResolveOptions): SandboxConfig {
 	const guestPath = merged.guestPath ? path.posix.normalize(merged.guestPath) : projectDir;
 	if (!path.posix.isAbsolute(guestPath)) throw new ConfigError(`guestPath must be absolute: ${guestPath}`);
 
+	if (backend === "workshop" && (guestPath === "/project" || guestPath.startsWith("/project/"))) {
+		throw new ConfigError(`guestPath ${guestPath} is reserved by workshop for its own project mount; choose another path`);
+	}
+	if (backend === "workshop" && guestPath === "/") throw new ConfigError("guestPath cannot be /");
+	const w = merged.workshop ?? {};
+	const workshopName = w.name || defaultWorkshopName(projectDir);
+	if (!validWorkshopName(workshopName)) throw new ConfigError(`invalid workshop name: ${workshopName}`);
 	const l = merged.lxd ?? {};
 	const instance = l.instance || defaultInstanceName(projectDir);
 	if (!validInstanceName(instance)) throw new ConfigError(`invalid LXD instance name: ${instance}`);
@@ -580,6 +725,15 @@ export function resolveConfig(opts: ResolveOptions): SandboxConfig {
 			storagePool: l.storagePool,
 			config: l.config ?? {},
 			onExit: l.onExit ?? "stop",
+		},
+		workshop: {
+			cli: w.cli || "workshop",
+			name: workshopName,
+			base: w.base || "ubuntu@24.04",
+			runtime: w.runtime ?? "lxd-container",
+			sdks: w.sdks ?? [],
+			onExit: w.onExit ?? "stop",
+			stateDir: w.stateDir ? expandHome(w.stateDir, home) : defaultStateDir(env, home),
 		},
 		sources,
 	};

@@ -25,10 +25,24 @@ import {
 import type { BackendInfo, SandboxBackend } from "./backend.ts";
 import { ConfigError, type SandboxConfig, resolveConfig } from "./config.ts";
 import { LxdBackend } from "./lxd.ts";
+import { WorkshopBackend } from "./workshop.ts";
 import { bashOps, editOps, executeGrep, findOps, lsOps, type OpsContext, readOps, writeOps } from "./ops.ts";
 import { PathMap } from "./paths.ts";
 
 const STATUS_KEY = "pion";
+
+/** Name of the sandbox instance, for status messages. */
+function targetName(cfg: SandboxConfig): string {
+	return cfg.backend === "workshop" ? `workshop ${cfg.workshop.name}` : `LXD VM ${cfg.lxd.instance}`;
+}
+
+/** How the environment is described to the model. */
+function environmentDescription(cfg: SandboxConfig): string {
+	if (cfg.backend === "workshop") {
+		return `Canonical Workshop ${cfg.workshop.runtime === "lxd-vm" ? "virtual machine" : "container"}`;
+	}
+	return "LXD virtual machine";
+}
 
 interface Sandbox {
 	cfg: SandboxConfig;
@@ -45,6 +59,8 @@ function createBackend(cfg: SandboxConfig): SandboxBackend {
 	switch (cfg.backend) {
 		case "lxd":
 			return new LxdBackend(cfg);
+		case "workshop":
+			return new WorkshopBackend(cfg);
 		default:
 			throw new ConfigError(`unsupported backend: ${cfg.backend}`);
 	}
@@ -57,13 +73,13 @@ function applyFlag(cfg: SandboxConfig, flag: string | undefined): SandboxConfig 
 	if (v === "ro" || v === "rw") {
 		return { ...cfg, backend: cfg.backend === "none" ? "lxd" : cfg.backend, mount: v, sources: [...cfg.sources, `--pion ${flag}`] };
 	}
-	if (v === "lxd") return { ...cfg, backend: "lxd", sources: [...cfg.sources, `--pion ${flag}`] };
-	throw new ConfigError(`--pion: expected none, lxd, ro or rw, got "${flag}"`);
+	if (v === "lxd" || v === "workshop") return { ...cfg, backend: v, sources: [...cfg.sources, `--pion ${flag}`] };
+	throw new ConfigError(`--pion: expected none, lxd, workshop, ro or rw, got "${flag}"`);
 }
 
 export default function pion(pi: ExtensionAPI) {
 	pi.registerFlag("pion", {
-		description: "pion sandbox override: none (run tools on the host), lxd, ro or rw",
+		description: "pion sandbox override: none (run tools on the host), lxd, workshop, ro or rw",
 		type: "string",
 	});
 
@@ -210,15 +226,15 @@ export default function pion(pi: ExtensionAPI) {
 		const hostCwdLine = opts.cwd;
 		if (!paths.identity) opts.cwd = paths.toGuest(opts.cwd);
 		const lines = [
-			`Your tools (read, write, edit, bash, ls, find, grep) run inside an isolated ${cfg.backend.toUpperCase()} virtual machine, not on the user's host.`,
+			`Your tools (read, write, edit, bash, ls, find, grep) run inside an isolated ${environmentDescription(cfg)}, not on the user's host.`,
 			`The project directory is mounted at ${cfg.guestPath}${paths.identity ? "" : ` (host path ${hostCwdLine})`} and is ${
 				cfg.mount === "ro"
 					? "READ-ONLY: you cannot modify project files. Writes, edits and commands that change files in the project will fail; explain proposed changes instead, or write scratch output outside the project (for example /tmp)."
 					: "writable: changes you make there are written to the user's host."
 			}`,
-			"Paths outside the project refer to the virtual machine's own filesystem. Software you install there does not affect the host.",
+			"Paths outside the project refer to the sandbox's own filesystem. Software you install there does not affect the host.",
 		];
-		if (cfg.sudo) lines.push("You have passwordless sudo inside the virtual machine.");
+		if (cfg.sudo) lines.push("You have passwordless sudo inside the sandbox.");
 		opts.sections.sandbox = lines.join("\n");
 		return undefined;
 	});
@@ -272,9 +288,9 @@ export default function pion(pi: ExtensionAPI) {
 				} else {
 					const sb = state.sandbox;
 					if (sb.info) lines.push(...sb.info.details);
-					else if (sb.starting) lines.push(`Sandbox: starting ${sb.cfg.lxd.instance}`);
+					else if (sb.starting) lines.push(`Sandbox: starting ${targetName(sb.cfg)}`);
 					else if (sb.error) lines.push(`Sandbox failed: ${sb.error.message}`);
-					else lines.push(`Sandbox: not started (${sb.cfg.lxd.instance})`);
+					else lines.push(`Sandbox: not started (${targetName(sb.cfg)})`);
 					lines.push(`Config sources: ${sb.cfg.sources.join("; ") || "built-in defaults"}`);
 				}
 				ctx.ui.notify(lines.join("\n"), state.kind === "error" ? "error" : "info");

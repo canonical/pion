@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
-import { ConfigError, defaultInstanceName, matchProject, parseEnvrc, resolveConfig, userConfigPath, validInstanceName } from "../src/config.ts";
+import { ConfigError, defaultInstanceName, defaultWorkshopName, matchProject, parseEnvrc, resolveConfig, userConfigPath, validInstanceName, validWorkshopName } from "../src/config.ts";
 
 let root: string;
 let home: string;
@@ -151,5 +151,61 @@ describe("names and paths", () => {
 	it("honours XDG_CONFIG_HOME", () => {
 		expect(userConfigPath({ XDG_CONFIG_HOME: "/xdg" }, "/home/u")).toBe("/xdg/pi/pion.json");
 		expect(userConfigPath({}, "/home/u")).toBe("/home/u/.config/pi/pion.json");
+	});
+});
+
+describe("workshop backend config", () => {
+	it("reads workshop settings from the user config", () => {
+		writeUser({
+			projects: {
+				[project]: {
+					backend: "workshop",
+					mount: "rw",
+					workshop: { base: "ubuntu@22.04", runtime: "lxd-vm", sdks: ["go/1.26/stable", { name: "uv", channel: "latest/edge" }, "node"], onExit: "delete" },
+				},
+			},
+		});
+		const cfg = resolve(project);
+		expect(cfg.backend).toBe("workshop");
+		expect(cfg.workshop.base).toBe("ubuntu@22.04");
+		expect(cfg.workshop.runtime).toBe("lxd-vm");
+		expect(cfg.workshop.sdks).toEqual([{ name: "go", channel: "1.26/stable" }, { name: "uv", channel: "latest/edge" }, { name: "node" }]);
+		expect(cfg.workshop.onExit).toBe("delete");
+		expect(cfg.workshop.name).toBe(defaultWorkshopName(project));
+		expect(cfg.workshop.stateDir).toBe(path.join(home, ".local", "state", "pion", "workshop"));
+	});
+
+	it("reads workshop settings from .envrc", () => {
+		writeFileSync(
+			path.join(project, ".envrc"),
+			"export PION_BACKEND=workshop\nexport PION_WORKSHOP_SDKS=go,uv/latest/stable\nexport PION_WORKSHOP_BASE=ubuntu@26.04\nexport PION_WORKSHOP_RUNTIME=lxd-container\n",
+		);
+		const cfg = resolve(project);
+		expect(cfg.backend).toBe("workshop");
+		expect(cfg.workshop.sdks).toEqual([{ name: "go" }, { name: "uv", channel: "latest/stable" }]);
+		expect(cfg.workshop.base).toBe("ubuntu@26.04");
+	});
+
+	it("rejects bad workshop values", () => {
+		expect(() => resolve(project, { env: { PION_BACKEND: "workshop", PION_WORKSHOP_BASE: "debian@12" } })).toThrow(/ubuntu@24.04/);
+		expect(() => resolve(project, { env: { PION_BACKEND: "workshop", PION_WORKSHOP_SDKS: "project-foo" } })).toThrow(/in-project SDKs/);
+		expect(() => resolve(project, { env: { PION_BACKEND: "workshop", PION_WORKSHOP_SDKS: "Go" } })).toThrow(/invalid SDK name/);
+		expect(() => resolve(project, { env: { PION_BACKEND: "workshop", PION_GUEST_PATH: "/project/x" } })).toThrow(/reserved by workshop/);
+		writeUser({ projects: { [project]: { backend: "workshop", workshop: { name: "Bad--Name" } } } });
+		expect(() => resolve(project)).toThrow(/invalid workshop name/);
+	});
+
+	it("keeps the workshop name and state dir out of reach of .envrc", () => {
+		writeFileSync(path.join(project, ".envrc"), "export PION_BACKEND=workshop\nexport PION_WORKSHOP_NAME=evil\n");
+		const cfg = resolve(project);
+		expect(cfg.workshop.name).toBe(defaultWorkshopName(project));
+		expect(cfg.sources.join()).toMatch(/ignored.*PION_WORKSHOP_NAME/);
+	});
+
+	it("derives valid workshop names", () => {
+		for (const dir of ["/a/My_Project.v2", "/a/---", "/", "/a/x--y", `/x/${"long".repeat(30)}`, "/a/9lives"]) {
+			const name = defaultWorkshopName(dir);
+			expect(validWorkshopName(name), name).toBe(true);
+		}
 	});
 });

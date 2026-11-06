@@ -31,6 +31,7 @@ const cfg = (mount: "ro" | "rw"): SandboxConfig => ({
 	installTools: true,
 	sudo: true,
 	lxd: { lxc: "lxc", remote: "", project: "", instance, image: process.env.PION_LXD_TEST_IMAGE || "ubuntu:24.04", profiles: [], config: {}, onExit: "delete", cpus: 2, memory: "2GiB" },
+	workshop: { cli: "workshop", name: "unused", base: "ubuntu@24.04", runtime: "lxd-container", sdks: [], onExit: "stop", stateDir: "/nonexistent" },
 	sources: ["test"],
 });
 

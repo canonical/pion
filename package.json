@@ -1,18 +1,26 @@
 {
   "name": "pion",
   "version": "0.1.0",
-  "description": "pi extension that runs the agent's tools inside a per-project sandbox (LXD VMs first)",
+  "description": "pi extension that runs the agent's tools inside a per-project sandbox (LXD VMs or Canonical Workshop)",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
-  "files": ["src", "README.md"],
+  "files": [
+    "src",
+    "README.md"
+  ],
   "scripts": {
     "check": "tsc --noEmit",
     "test": "vitest --run",
-    "test:lxd": "PION_LXD_TEST=1 vitest --run test/lxd.integration.test.ts"
+    "test:lxd": "PION_LXD_TEST=1 vitest --run test/lxd.integration.test.ts",
+    "test:workshop": "PION_WORKSHOP_TEST=1 vitest --run test/workshop.integration.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=1.4.0"
