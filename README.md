@@ -16,9 +16,21 @@ Projects without configuration are untouched: the tools behave exactly like pi's
 
 ## Install
 
+From the snap, for the pi-coding-agent snap:
+
+```bash
+sudo snap install pion
+pi install /snap/pion/current/pi/extensions/pion
+```
+
+From a checkout:
+
 ```bash
 pi install /path/to/pion          # or: pi -e /path/to/pion for one run
 ```
+
+pi records the path through the `current` symlink, so the extension keeps loading after the snap
+refreshes. Restart running pi sessions to pick up the new version.
 
 Requirements:
 
@@ -233,4 +245,5 @@ npm run check        # type-check
 npm test             # unit tests; shell scripts run against a local exec double
 npm run test:lxd       # end-to-end: creates and deletes a real LXD VM
 npm run test:workshop  # end-to-end: launches and removes real workshops
+snapcraft pack         # builds pion_<version>_all.snap; runs the type-check and unit tests
 ```

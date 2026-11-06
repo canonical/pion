@@ -1,0 +1,69 @@
+name: pion
+title: pion
+summary: Run pi's coding-agent tools in an LXD VM or Canonical Workshop sandbox
+description: |
+  pion is an extension for the pi coding agent (the pi-coding-agent snap). For
+  projects you configure, pi's built-in read, write, edit, bash, ls, find and
+  grep tools, and `!` shell commands, run inside a per-project sandbox instead
+  of on your host. The project directory is mounted into the sandbox read-only
+  or writable.
+
+  Backends:
+    - lxd: an LXD virtual machine that pion creates and manages
+    - workshop: a Canonical Workshop container or VM, with SDKs such as Go
+
+  This snap only ships the extension. pi loads it in its own process, so it
+  needs no apps of its own. Load it into pi with:
+
+    pi install /snap/pion/current/pi/extensions/pion
+
+  Configure projects in ~/.config/pi/pion.json or in a project's .envrc; see
+  /snap/pion/current/pi/extensions/pion/README.md.
+license: MIT
+contact: mailto:harry.pidcock@canonical.com
+issues: https://github.com/canonical/pion/issues
+source-code: https://github.com/canonical/pion
+website: https://github.com/canonical/pion
+adopt-info: pion
+
+# The payload is TypeScript source that pi executes with its own bundled
+# Node.js, so it works on every architecture. core26 matches pi-coding-agent.
+base: core26
+grade: stable
+confinement: strict
+
+platforms:
+  all:
+    build-on: [amd64]
+    build-for: [all]
+
+parts:
+  pion:
+    plugin: nil
+    source: .
+    source-type: local
+    build-snaps:
+      - node/22/stable
+    override-pull: |
+      craftctl default
+      # The local source copy may include a developer's node_modules; build
+      # from the lockfile instead.
+      rm -rf "$CRAFT_PART_SRC/node_modules"
+    override-build: |
+      set -eux
+
+      # Check the code before shipping it: type-check and unit tests. The
+      # LXD and workshop integration tests are opt-in and skipped here.
+      npm ci --ignore-scripts --no-audit --no-fund
+      npx tsc --noEmit
+      npx vitest --run
+
+      craftctl set version="$(node -p "require('./package.json').version")"
+
+      # Ship the extension as a pi package: package.json, README and the
+      # TypeScript sources. pi provides @earendil-works/pi-coding-agent at
+      # runtime, and there are no other runtime dependencies, so no
+      # node_modules are shipped.
+      DEST="$CRAFT_PART_INSTALL/pi/extensions/pion"
+      install -D -m 0644 -t "$DEST" package.json README.md
+      install -D -m 0644 -t "$DEST/src" src/*.ts

@@ -23,7 +23,7 @@
     "test:workshop": "PION_WORKSHOP_TEST=1 vitest --run test/workshop.integration.test.ts"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=1.4.0"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.4.0",
