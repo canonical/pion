@@ -1,5 +1,7 @@
 # pion
 
+[![pion](https://snapcraft.io/pion/badge.svg)](https://snapcraft.io/pion)
+
 A [pi](https://github.com/earendil-works/pi) extension that runs the agent's tools inside a
 per-project sandbox instead of on your host. Two backends are available:
 
@@ -16,28 +18,63 @@ Projects without configuration are untouched: the tools behave exactly like pi's
 
 ## Install
 
-From the snap, for the pi-coding-agent snap:
+### From the snap
+
+1. Install pi from the pi-coding-agent snap, if you don't have it:
+
+   ```bash
+   sudo snap install pi-coding-agent --classic
+   ```
+
+2. Install a sandbox backend. You only need the one you plan to use:
+
+   ```bash
+   sudo snap install lxd && sudo lxd init --auto   # lxd backend
+   sudo usermod -aG lxd "$USER"                    # then log out and back in
+   sudo snap install workshop --classic            # workshop backend
+   ```
+
+3. Install pion:
+
+   ```bash
+   sudo snap install pion
+   ```
+
+4. Add the extension to pi:
+
+   ```bash
+   pi install /snap/pion/current/pi/extensions/pion
+   ```
+
+5. Check that pi loaded it. Start pi and run `/pion`. In a project you have not configured
+   yet, it reports `Sandbox: off (tools run on the host)`.
+
+pi records the path through the snap's `current` symlink, so you don't need to install it again
+when the snap refreshes. Restart running pi sessions to pick up a new version.
+
+To install a locally built snap instead of the store one, build it with `snapcraft pack` and use
+`sudo snap install --dangerous ./pion_<version>_all.snap` in step 3.
+
+To remove pion:
 
 ```bash
-sudo snap install pion
-pi install /snap/pion/current/pi/extensions/pion
+pi remove /snap/pion/current/pi/extensions/pion
+sudo snap remove pion
 ```
 
-From a checkout:
+Remove it from pi first. Otherwise pi keeps a stale entry for the removed path in `pi list`.
+
+### From a checkout
 
 ```bash
 pi install /path/to/pion          # or: pi -e /path/to/pion for one run
 ```
 
-pi records the path through the `current` symlink, so the extension keeps loading after the snap
-refreshes. Restart running pi sessions to pick up the new version.
-
-Requirements:
+### Requirements
 
 - **lxd backend:** the `lxc` CLI talking to an LXD server that can run VMs
   (`lxc launch --vm` works), and your user in the `lxd` group.
-- **workshop backend:** the `workshop` CLI, for example `snap install workshop --classic`.
-  Tested with workshop 0.9.9.
+- **workshop backend:** the `workshop` CLI. Tested with workshop 0.9.9.
 
 ## Configure a project
 
